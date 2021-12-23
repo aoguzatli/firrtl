@@ -1,0 +1,7 @@
+[
+  {
+    "class":"barstools.tapeout.transforms.ReParentCircuitAnnotation",
+    "target":"~TestHarness|DigitalTop"
+  }
+]
+
