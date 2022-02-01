@@ -9,37 +9,30 @@ import firrtl.stage.Forms
 import firrtl.stage.TransformManager.TransformDependency
 import firrtl.transforms.DeadCodeElimination
 import java.io.{File, PrintWriter}
-
-import jdk.nashorn.internal.runtime.regexp.joni.exception.ValueException
-
 import scala.collection.mutable.ListBuffer
-import scala.collection.mutable.Map
 import scala.collection.mutable
+import scala.math.log
+import scala.io.Source
 
-class IntPtr {
-  var value = 0
+
+object CustomOps {
+  def and(a: Expression, b: Expression) = DoPrim(PrimOps.And, Seq(a, b), Nil, a.tpe)
+  def or(a: Expression, b: Expression) = DoPrim(PrimOps.Or, Seq(a, b), Nil, a.tpe)
+  def xor(a: Expression, b: Expression) = DoPrim(PrimOps.Xor, Seq(a, b), Nil, a.tpe)
+  def not(a: Expression) = DoPrim(PrimOps.Not, Seq(a), Nil, a.tpe)
+  def mux(s: Expression, a1: Expression, a0: Expression) = or(and(s, a1), and(not(s), a0))
+  def asSInt(a: Expression) = DoPrim(PrimOps.AsSInt, Seq(a), Nil, SIntType(UnknownWidth))
+  def asUInt(a: Expression) = DoPrim(PrimOps.AsUInt, Seq(a), Nil, UIntType(UnknownWidth))
 }
 
-
-
-object InjInterface {
-  private def and(a: Expression, b: Expression) = DoPrim(PrimOps.And, Seq(a, b), Nil, a.tpe)
-  private def or(a: Expression, b: Expression) = DoPrim(PrimOps.Or, Seq(a, b), Nil, a.tpe)
-  private def not(a: Expression) = DoPrim(PrimOps.Not, Seq(a), Nil, a.tpe)
-//  private def asSInt(a: Expression) = a match {
-//    case DoPrim(_, _, _, t: UIntType) =>
-//      DoPrim(PrimOps.AsSInt, Seq(a), Nil, SIntType(t.width))
-//    case _ =>
-//      throw new RuntimeException
-//  }
-
-  private def asSInt(a: Expression) = DoPrim(PrimOps.AsSInt, Seq(a), Nil, SIntType(UnknownWidth))
-  private def asUInt(a: Expression) = DoPrim(PrimOps.AsUInt, Seq(a), Nil, UIntType(UnknownWidth))
+object InjInterfaceFF {
+  import CustomOps._
 
   def apply(d: Expression, q: Expression, inj: Expression, halt: Expression): Expression = {
     // Mux(inj, not(q), Mux(halt, q, d))
     // == (inj & not(q)) | (not(inj) & Mux...))
-    val logic = or(and(inj, not(asUInt(q))), and(not(inj), Mux(halt, asUInt(q), asUInt(d))))
+//    val logic = or(and(inj, not(asUInt(q))), and(not(inj), Mux(halt, asUInt(q), asUInt(d))))
+    val logic = mux(inj, not(asUInt(q)), Mux(halt, asUInt(q), asUInt(d)))
     if (d.tpe.isInstanceOf[SIntType]) {
       asSInt(logic)
     } else {
@@ -48,29 +41,76 @@ object InjInterface {
   }
 }
 
-class FI extends Transform {
-//  override def prerequisites: List[TransformDependency] = Forms.LowForm.toList
-//  override def invalidates(xform: Transform): Boolean = xform match {
-//    case _          => false
-//  }
-//  override def optionalPrerequisites: Seq[TransformDependency] = Seq.empty
-//  override def optionalPrerequisiteOf: Seq[TransformDependency] = Seq.empty
+object InjInterfaceMacro {
+  import CustomOps._
 
-  val inputForm = LowForm
-  val outputForm = HighForm
+  def apply(d: Expression, radr: Expression, wadr: Expression, we: Expression, q: Expression, mask: Expression,
+            injEn: Expression, injBitsRow: Expression, injBitsCol: Expression, halt: Expression):
+            (Expression, Expression, Expression, Expression, Expression) = {
+    val maskWidth =  IntWidth.unapply(mask.tpe.asInstanceOf[GroundType].width.asInstanceOf[IntWidth]).get.toInt
+    val dOut = Mux(injEn, xor(q, injBitsCol), d)
+    val weOut = or(injEn, and(not(halt), we))
+    val radrOut = Mux(injEn, injBitsRow, radr)
+    val wadrOut = Mux(injEn, injBitsRow, wadr)
+    val maskOut = Mux(injEn, UIntLiteral((1<<maskWidth)-1), mask)
+    (dOut, weOut, radrOut, wadrOut, maskOut)
+  }
 
-  val annotationClasses = Seq(classOf[TMRAnnotation])
-  type Inst2Inj = mutable.Map[String, Option[Int]]
-  type Mod2Inj = mutable.Map[String, (Option[Int], Inst2Inj)]
+    def gatedWE(halt: Expression, we: Expression) = {
+      and(not(halt), we)
+    }
+}
 
-  type Inst2Clk = mutable.Map[(String, String), String]
-  type Mod2Clk = mutable.Map[String, Inst2Clk]
 
-//  val bannedModules = Seq("ChipTop", "TestHarness", "DividerOnlyClockGenerator", "ClockDividerN", "ClockDividerN_1", "ClockGroupAggregator_6", "ClockGroupAggregator_1", "ClockGroupParameterModifier", "ClockGroupParameterModifier_1", "ClockGroupResetSynchronizer")
-  val bannedModules = Seq()
+class ModuleData() {
+  val insts = mutable.Map[String, ModuleData]()
+  val macros = mutable.Map[String, MacroData]()
+  val clkNetwork = mutable.Map[String, String]()
+  var ffs = 0
 
-  def getHaltPortOf(name: String, inst2clk: Inst2Clk): Expression = {
-    val matches = inst2clk.filter(_._1._1 == name)
+  var _allffs = Option.empty[Int]
+  var _allMacros = Option.empty[mutable.Map[String, MacroData]]
+  var _ffOffset = 0
+  var _macroOffset = 0
+
+  def getMacroOffset(width: Int): Int = {
+    _macroOffset += width
+    assert(_macroOffset <= allMacros.size)
+    _macroOffset - width
+  }
+
+  def getFFOffset(width: Int): Int = {
+    _ffOffset += width
+    assert(_ffOffset <= allffs)
+    _ffOffset - width
+  }
+
+  def allffs: Int = {
+    if (_allffs.isEmpty) {
+      _allffs = Some(ffs + insts.map(_._2.allffs).sum)
+    }
+    _allffs.get
+  }
+
+  def allMacros: mutable.Map[String, MacroData] = {
+    if (_allMacros.isEmpty) {
+      _allMacros = Some(macros)
+      for ((instName, instData) <- insts) {
+        for ((macroName, instMacro) <- instData.allMacros)
+        _allMacros.get(s"${instName}/${macroName}") = instMacro
+      }
+//      println(s"Total ${m.name}: ${_allMacros.get}")
+    }
+    _allMacros.get
+  }
+
+  def maxMacroWidth: Int = {
+    assert(allMacros.nonEmpty)
+    allMacros.map(_._2.width).max
+  }
+
+  def getHaltPortOf(name: String): Expression = {
+    val matches = clkNetwork.filter(_._1 == name)
     if (matches.isEmpty) {
       val portName = name.split("/")
       if (portName.size == 2) {
@@ -81,149 +121,238 @@ class FI extends Transform {
 
     } else {
       assert(matches.size == 1)
-      if (matches.contains((name, "inst"))) {
-        return getHaltPortOf(matches((name, "inst")), inst2clk)
-      } else {
-        return getHaltPortOf(matches((name, "wire")), inst2clk)
-      }
+      return getHaltPortOf(matches(name))
     }
   }
 
-  def total(elem: Tuple2[Option[Int], Inst2Inj]) : Option[Int] = {
-    if (elem._1.isEmpty)
-      Option.empty[Int]
-    else {
-      var total = elem._1.get
-      for ((k, v) <- elem._2) {
-        if (v.isEmpty) {
-          return Option.empty[Int]
-        } else {
-          total += v.get
-        }
-      }
-      Some(total)
-    }
+  def setFFParams(n: Int): Unit = {
+    _allffs = Some(n)
   }
 
-  def populateInst2Inj(mod2inj: Mod2Inj, inst2inj: Inst2Inj)(s: Statement): Statement = {
+  def setMacroParams(n: Int, width: Int) : Unit = {
+    val macroMap = for (i <- 0 until n) yield ("Dummy", new MacroData("Dummy", width, mutable.Map[String, Expression]()))
+    _allMacros = Some(mutable.Map() ++ macroMap.toMap)
+  }
+}
+
+class ExtModuleData(numFFs: Int, injSelWidth: Int, injBitsWidth: Int) extends ModuleData {
+  _allffs = Some(numFFs)
+  _allMacros = Some(_dummyMacros(injSelWidth))
+
+  def _dummyMacros(i: Int) : mutable.Map[String, MacroData] = {
+    val macroMap = for (i <- 0 until injSelWidth) yield ("Dummy", new MacroData("Dummy", injBitsWidth, mutable.Map[String, Expression]()))
+    mutable.Map() ++ macroMap.toMap
+  }
+}
+
+case class MacroData(tpe: String, width: Int, signals: mutable.Map[String, Expression]);
+
+class FI extends Transform {
+  val inputForm = LowForm
+  val outputForm = HighForm
+
+  val annotationClasses = Seq(classOf[TMRAnnotation])
+  val bannedModules = Seq()
+
+  def log2Up(x: Int) : Int = {
+    math.max(1, (log(x.toFloat)/log(2.0)).toInt)
+  }
+
+  var stmtDelta = 0
+
+  def connectInjStmt(moduleData: ModuleData, fp: PrintWriter)(s: Statement): Statement = {
     s match {
-      case s: DefInstance =>
-        inst2inj(s.name) = total(mod2inj(s.module))
-      case _ =>
-    }
-
-    s map populateInst2Inj(mod2inj, inst2inj)
-  }
-
-  def countRegs(counts: ListBuffer[Int])(s: Statement): Statement = {
-    s match {
-      case s: DefRegister =>
-        val width = s.tpe.asInstanceOf[GroundType].width.asInstanceOf[IntWidth]
-        counts += IntWidth.unapply(width).get.toInt
-      case _ =>
-    }
-    s map countRegs(counts)
-  }
-
-  def connectInjStmt(offset: IntPtr, inst2inj: Inst2Inj, inst2clk: Inst2Clk, fp: PrintWriter)(s: Statement): Statement = {
-    s match {
-      case Connect(info, WRef(name, tpe, RegKind, SinkFlow), rhs_orig)  =>
+      case Connect(info, WRef(name, tpe, RegKind, SinkFlow), rhs_orig) if moduleData.allffs != 0  => // Need the if check because of TLMonitors
         val width = IntWidth.unapply(tpe.asInstanceOf[GroundType].width.asInstanceOf[IntWidth]).get.toInt
-        val halt = getHaltPortOf(inst2clk((name, "reg")), inst2clk)
+        val offset = moduleData.getFFOffset(width)
+        val clk = moduleData.clkNetwork(name)
+        val halt = moduleData.getHaltPortOf(clk)
+        val inj = DoPrim(PrimOps.Bits, Seq(WRef("inj_ff")), Seq(offset + width - 1, offset), UnknownType)
         val lhs = WRef(name)
-        val rhs = InjInterface(rhs_orig, lhs, DoPrim(PrimOps.Bits, Seq(WRef("inj")), Seq(offset.value + width - 1, offset.value), lhs.tpe), halt)
+        val rhs = InjInterfaceFF(rhs_orig, lhs, inj, halt)
         val conn = Connect(info, lhs, rhs)
-        fp.write(s"reg ${name} ${offset.value + width - 1}:${offset.value}\n")
-        offset.value += width
-
+        fp.write(s"reg ${name} ${offset + width - 1}:${offset}\n")
         conn
 
-      case s: DefInstance =>
-        val width = inst2inj(s.name).get
-        if (width == 0) {
+      case s: DefMemory =>
+        val memData = moduleData.macros(s.name)
+        if (memData.tpe == "SyncMem") {
           s
         } else {
-          val lhs = SubField(WRef(s.name), "inj", UnknownType, UnknownFlow)
-          val rhs: Expression = DoPrim(PrimOps.Bits, Seq(WRef("inj")), Seq(offset.value + width - 1, offset.value), lhs.tpe)
-          val inj_connect = PartialConnect(s.info, lhs, rhs)
-          fp.write(s"inst:${s.module} ${s.name} ${offset.value + width - 1}:${offset.value}\n")
-          offset.value += width
-          Block(Seq(s, inj_connect))
+          // Works for single ported FF-based async memories for now
+//          assert(s.readers.size == 1 && s.writers.size == 1)
+          val rdPort = s.readers(0)
+          val wrPort = s.writers(0)
+          val width = IntWidth.unapply(s.dataType.asInstanceOf[GroundType].width.asInstanceOf[IntWidth]).get.toInt
+          val depth = s.depth.intValue
+
+          val d = memData.signals(s"${wrPort}/data")
+          val q = SubField(SubField(Reference(s.name), rdPort), "data")
+          val radr = memData.signals(s"${rdPort}/addr")
+          val wadr = memData.signals(s"${wrPort}/addr")
+          val we = memData.signals(s"${wrPort}/en")
+          val re = memData.signals(s"${rdPort}/en")
+          val wclk = memData.signals(s"${wrPort}/clk")
+          val rclk = memData.signals(s"${rdPort}/clk")
+          val mask = memData.signals(s"${wrPort}/mask")
+          val halt = moduleData.getHaltPortOf(wclk.asInstanceOf[HasName].name)
+          val injEnIdx = moduleData.getMacroOffset(1)
+          val injEn = DoPrim(PrimOps.Bits, Seq(WRef("inj_macro_sel")), Seq(injEnIdx, injEnIdx), UnknownType)
+
+          val injBits = WRef("inj_macro_bits")
+          val injBitsCol = DoPrim(PrimOps.Bits, Seq(injBits), Seq(log2Up(width)-1, 0), UnknownType)
+          val injBitsRow = DoPrim(PrimOps.Bits, Seq(injBits), Seq(log2Up(width)+log2Up(depth)-1, log2Up(width)), UnknownType)
+
+          val (dNew, weNew, radrNew, wadrNew, maskNew) = InjInterfaceMacro(d, radr, wadr, we, q, mask, injEn, injBitsRow, injBitsCol, halt)
+
+          val info = NoInfo
+          val wadrConn = Connect(info, SubField(SubField(Reference(s.name), wrPort), "addr"), wadrNew)
+          val weConn = Connect(info, SubField(SubField(Reference(s.name), wrPort), "en"), weNew)
+          val wclkConn = Connect(info, SubField(SubField(Reference(s.name), wrPort), "clk"), wclk)
+          val dConn = Connect(info, SubField(SubField(Reference(s.name), wrPort), "data"), dNew)
+          val maskConn = Connect(info, SubField(SubField(Reference(s.name), wrPort), "mask"), maskNew)
+
+          val radrConn = Connect(info, SubField(SubField(Reference(s.name), rdPort), "addr"), radrNew)
+          val reConn = Connect(info, SubField(SubField(Reference(s.name), wrPort), "en"), re)
+          val rclkConn = Connect(info, SubField(SubField(Reference(s.name), wrPort), "clk"), rclk)
+
+          var newStmts = Seq(wadrConn, weConn, wclkConn, dConn, radrConn, reConn, rclkConn, maskConn)
+
+          // TODO: Gating the WE of the other write ports. Assumes they operate on the same clk domain
+          // separate power domains.
+          for (i <- 1 until s.writers.size) {
+            val auxWrPort = s.writers(i)
+            val newAuxWE = InjInterfaceMacro.gatedWE(halt, memData.signals(s"${auxWrPort}/en"))
+            newStmts = newStmts ++ Seq(
+              Connect(info, SubField(SubField(Reference(s.name), auxWrPort), "addr"), memData.signals(s"${auxWrPort}/addr")),
+              Connect(info, SubField(SubField(Reference(s.name), auxWrPort), "en"), newAuxWE),
+              Connect(info, SubField(SubField(Reference(s.name), auxWrPort), "clk"), memData.signals(s"${auxWrPort}/clk")),
+              Connect(info, SubField(SubField(Reference(s.name), auxWrPort), "data"), memData.signals(s"${auxWrPort}/data")),
+              Connect(info, SubField(SubField(Reference(s.name), auxWrPort), "mask"), memData.signals(s"${auxWrPort}/mask")))
+          }
+
+          for (i <- 1 until s.readers.size) {
+            val auxRdPort = s.readers(i)
+            newStmts = newStmts ++ Seq(
+              Connect(info, SubField(SubField(Reference(s.name), auxRdPort), "addr"), memData.signals(s"${auxRdPort}/addr")),
+              Connect(info, SubField(SubField(Reference(s.name), auxRdPort), "en"), memData.signals(s"${auxRdPort}/en")),
+              Connect(info, SubField(SubField(Reference(s.name), auxRdPort), "clk"), memData.signals(s"${auxRdPort}/clk")))
+          }
+
+          stmtDelta += newStmts.size
+          s
+        }
+
+      case s: DefInstance =>
+        if (s.module == "cc_dir_0_ext") {
+          println(s"Debug: 1")
+        }
+        if (!moduleData.insts.contains(s.name)) {
+          s
+        } else {
+          if (s.module == "cc_dir_0_ext") {
+            println(s"Debug: 2")
+          }
+
+          val newStmts = mutable.ArrayBuffer[Statement]()
+
+          val ffWidth = moduleData.insts(s.name).allffs
+          if (ffWidth == 0) {
+            s
+          } else {
+            val ffOffset = moduleData.getFFOffset(ffWidth)
+            val lhs = SubField(WRef(s.name), "inj_ff", UnknownType, UnknownFlow)
+            val rhs = DoPrim(PrimOps.Bits, Seq(WRef("inj_ff")), Seq(ffOffset + ffWidth - 1, ffOffset), lhs.tpe)
+            val inj_connect = PartialConnect(s.info, lhs, rhs)
+            fp.write(s"inst_ff:${s.module} ${s.name} ${ffOffset + ffWidth - 1}:${ffOffset}\n")
+            newStmts += inj_connect
+          }
+
+          val macroInjWidth = moduleData.insts(s.name).allMacros.size
+          if (macroInjWidth == 0) {
+            s
+          } else {
+            if (s.module == "cc_dir_0_ext") {
+              println(s"Debug: 3")
+            }
+            val macroOffset = moduleData.getMacroOffset(macroInjWidth)
+            val sel_lhs = SubField(WRef(s.name), "inj_macro_sel", UnknownType, UnknownFlow)
+            val sel_rhs = DoPrim(PrimOps.Bits, Seq(WRef("inj_macro_sel")), Seq(macroOffset + macroInjWidth - 1, macroOffset), sel_lhs.tpe)
+
+            val bits_lhs = SubField(WRef(s.name), "inj_macro_bits", UnknownType, UnknownFlow)
+            val bits_rhs = Reference("inj_macro_bits")
+
+            fp.write(s"inst_macro:${s.module} ${s.name} ${macroOffset + macroInjWidth - 1}:${macroOffset}\n")
+            newStmts += PartialConnect(s.info, sel_lhs, sel_rhs)
+            newStmts += PartialConnect(s.info, bits_lhs, bits_rhs)
+          }
+          Block(Seq(s) ++ newStmts)
         }
 
       case _ =>
-        s map connectInjStmt(offset, inst2inj, inst2clk, fp)
+        s map connectInjStmt(moduleData, fp)
     }
   }
 
-  def connectHaltStmt(inst2clk: Inst2Clk)(s: Statement): Statement = {
+  def connectHaltStmt(moduleData: ModuleData)(s: Statement): Statement = {
     s match {
       // instance.clock <= clockPort
       case s: DefInstance =>
-        val clks = inst2clk.filter(_._1._1 == s.name)
-        val halt_connects = clks.map(clk => Connect(s.info, SubField(WRef(s.name), s"halt_${clk._1._2}", UnknownType, UnknownFlow), getHaltPortOf(clk._2, inst2clk)))
+        val clks = moduleData.clkNetwork.filter(_._1.split("/")(0) == s.name)
+        val halt_connects = clks.map(clk => Connect(s.info, SubField(WRef(s.name), s"halt_${clk._1.split("/")(1)}", UnknownType, UnknownFlow), moduleData.getHaltPortOf(clk._2)))
         Block(Seq(s) ++ halt_connects)
 
       // clockPort <= net
       case Connect(info, Reference(lhs_name, ClockType, PortKind, lhs_flow), Reference(rhs_name, rhs_type, rhs_kind, rhs_flow)) =>
         val halt_conn = Connect(info,
           WRef(s"halt_${lhs_name}"),
-          getHaltPortOf(rhs_name, inst2clk))
+          moduleData.getHaltPortOf(rhs_name))
         Block(Seq(s, halt_conn))
 
       // clockPort <= instance.clock
       case Connect(info, Reference(lhs_name, ClockType, PortKind, lhs_flow), SubField(rhs_ref, rhs_name, rhs_kind, rhs_flow)) =>
         val halt_conn = Connect(info,
           WRef(s"halt_${lhs_name}"),
-          getHaltPortOf(s"${rhs_ref.serialize}/$rhs_name", inst2clk))
+          moduleData.getHaltPortOf(s"${rhs_ref.serialize}/$rhs_name"))
         Block(Seq(s, halt_conn))
 
       // instance.clock <= otherInstance.clock
       case Connect(info, SubField(lhs_ref, lhs_name, ClockType, lhs_flow), SubField(rhs_ref, rhs_name, rhs_kind, rhs_flow)) =>
         val halt_conn = Connect(info,
-          getHaltPortOf(s"${lhs_ref.serialize}/$lhs_name", inst2clk),
-          getHaltPortOf(s"${rhs_ref.serialize}/$rhs_name", inst2clk))
+          moduleData.getHaltPortOf(s"${lhs_ref.serialize}/$lhs_name"),
+          moduleData.getHaltPortOf(s"${rhs_ref.serialize}/$rhs_name"))
         Block(Seq(s, halt_conn))
 
       case _ =>
-        s map connectHaltStmt(inst2clk)
+        s map connectHaltStmt(moduleData)
     }
   }
 
-  def populateMod2Inj(mod2inj: Mod2Inj)(m: DefModule) : DefModule = {
-    val inst2inj = mod2inj(m.name)._2
-    val regWidths = new ListBuffer[Int]()
-    m map populateInst2Inj(mod2inj, inst2inj) // Populates inst2inj
-    m map countRegs(regWidths)
 
-    if (total(mod2inj(m.name)).isEmpty) {
-      if (m.ports.forall(_.direction == Input) && !bannedModules.contains(m.name) ) { // Prevent TLMonitors from creating too many inj ports
-        mod2inj(m.name) = (Some(0), inst2inj)
-      } else if (inst2inj.isEmpty || inst2inj.forall(_._2.nonEmpty)) { // Leaf instance condition
-        mod2inj(m.name) = (Some(regWidths.sum), inst2inj)
-      }
+  def addInjPortsMod(moduleDataMap: Map[String, ModuleData])(m: DefModule) : DefModule = {
+    val moduleData = moduleDataMap(m.name)
+    val inj_ff_width = moduleData.allffs
+    val inj_macro_sel_width = moduleData.allMacros.size
+
+    val newPorts = mutable.ListBuffer[Port]()
+    if (inj_ff_width != 0) {
+      newPorts += Port(NoInfo, "inj_ff", Input, UIntType(new IntWidth(inj_ff_width)))
     }
-
-    m
-  }
-
-  def addInjPortsMod(mod2inj: Mod2Inj)(m: DefModule) : DefModule = {
-    val injWidth = total(mod2inj(m.name)).get
-    val newPorts = Seq(Port(NoInfo, "inj", Input, UIntType(new IntWidth(injWidth)))) ++ m.ports
+    if (inj_macro_sel_width != 0) {
+      newPorts += Port(NoInfo, "inj_macro_sel", Input, UIntType(new IntWidth(inj_macro_sel_width)))
+      val inj_macro_bits_width = moduleData.maxMacroWidth
+      newPorts += Port(NoInfo, "inj_macro_bits", Input, UIntType(new IntWidth(inj_macro_bits_width)))
+    }
 
     m match {
       case Module(info, name, _, body) =>
-        if (injWidth == 0 || bannedModules.contains(name) ) {
-          m
-        } else {
-          Module(info, name, newPorts, body)
-        }
+        Module(info, name, m.ports ++ newPorts, body)
       case ExtModule(info, name, ports, defname, params) =>
-        m
+        ExtModule(info, name, ports ++ newPorts, defname, params)
     }
   }
 
-  def addHaltPortsMod(mod2inj: Mod2Inj)(m: DefModule) : DefModule = {
+  def addHaltPortsMod(m: DefModule) : DefModule = {
     val clkPorts = m.ports.filter(_.tpe == ClockType)
     val haltPorts = clkPorts.map(p => Port(NoInfo, s"halt_${p.name}", p.direction, UIntType(new IntWidth(1))))
 
@@ -245,45 +374,117 @@ class FI extends Transform {
     }
   }
 
-  def connectInjMod(mod2inj: Mod2Inj, mod2clk: Mod2Clk, fp: PrintWriter)(m: DefModule) : DefModule = {
-    val inst2inj = mod2inj(m.name)._2
-    val inst2clk = mod2clk(m.name)
-
-    if (bannedModules.contains(m.name) || total(mod2inj(m.name)).get == 0) {
+  def connectInjMod(moduleDataMap: Map[String, ModuleData], fp: PrintWriter)(m: DefModule): DefModule = {
+    if (bannedModules.contains(m.name)) {
+      fp.write(s"--- Module skipped: ${m.name} - Numffs: ${moduleDataMap(m.name).allffs}\n")
       m
     } else {
-      fp.write(s"--- Module ${m.name}\n")
-      m map connectInjStmt(new IntPtr, inst2inj, inst2clk, fp)
+      fp.write(s"--- Module: ${m.name}\n")
+      m match {
+        case i: Module =>
+          println(s"Class: ${i.body.getClass}")
+        case _ =>
+      }
+
+      m map connectInjStmt(moduleDataMap(m.name), fp)
+
+
     }
   }
 
-  def connectHaltMod(mod2clk: Mod2Clk)(m: DefModule) : DefModule = {
-    val inst2clk = mod2clk(m.name)
+  def connectHaltMod(moduleDataMap: Map[String, ModuleData])(m: DefModule) : DefModule = {
+    val moduleData = moduleDataMap(m.name)
     val clkPorts = m.ports.filter(_.tpe == ClockType)
 
     if (bannedModules.contains(m.name) || clkPorts.isEmpty) {
       m
     } else {
-      m map connectHaltStmt(inst2clk)
+      m map connectHaltStmt(moduleData)
     }
   }
 
-  def populateMod2Clk(mod2clk: Mod2Clk)(m: DefModule) : DefModule = {
-    val inst2clk = mutable.Map[(String, String), String]()
-    mod2clk(m.name) = inst2clk
-    m map populateInst2Clk(inst2clk)
+  def populateModulePorts(moduleData: ModuleData)(s: Statement) : Statement = {
+    /*
+     * Find the AsyncMem port connections and populate ModuleData to contain the nets that
+     * connect to them. It also removes those statements to be replaced by the connectInj method.
+     */
+//    if (containsReference(s, "io_deq_bits_data")) {
+//      println("This stmt contains the net:")
+//      println(s)
+//    }
+
+    val asyncMems = moduleData.macros.filter(m => m._2.tpe == "AsyncMem").keys.toSeq
+    s match {
+      // Sinkflow
+      case Connect(info, SubField(SubField(Reference(memName, _, _, _), portName, _, _), pinName, _, _), net)
+        if asyncMems.contains(memName) =>
+//          println(s"Memory connection: ${memName}/${portName}/${pinName}")
+          moduleData.macros(memName).signals(s"${portName}/${pinName}") = net
+          stmtDelta -= 1
+          EmptyStmt
+
+//      // Sourceflow
+//      case Connect(info, net, SubField(SubField(Reference(memName, _, _, _), portName, _, _), pinName, _, _))
+//        if asyncMems.contains(memName) =>
+//          if (net.asInstanceOf[HasName].name == "io_deq_bits_data") {
+//            println("MATCHED")
+//            println(s)
+//          }
+//          println(s"Memory connection: ${memName}/${portName}/${pinName}")
+//          moduleData.macros(memName).signals(s"${portName}/${pinName}") = net
+//          EmptyStmt
+
+      case _ =>
+        s map populateModulePorts(moduleData)
+    }
   }
 
+  def containsReference(s: Statement, str: String) : Boolean = {
+//    s.foreachStmt(i => if (containsReference(i, str)) return true)
+    s.foreachExpr(i => if (containsReference(i, str)) return true)
+    return false
+  }
 
-  def populateInst2Clk(inst2clk: Inst2Clk)(s: Statement) : Statement = {
+  def containsReference(e: Expression, str: String): Boolean = {
+    e match {
+      case i: HasName if i.name == str =>
+        return true
+      case _ =>
+        e.foreachExpr(i => if (containsReference(i, str)) return true)
+    }
+    return false
+  }
+
+  def printModule(m: DefModule): Unit = {
+    m.foreachStmt(printStatement)
+  }
+
+  def printStatement(s: Statement): Unit = {
+    if (isComplexStmt(s)) {
+      s.foreachStmt(printStatement)
+    } else {
+      println(s)
+    }
+  }
+
+  def isComplexStmt(s: Statement): Boolean = {
+    var out = false
+    s.foreachStmt{case i =>
+      out = true
+    }
+    out
+  }
+
+  def populateClkNetwork(moduleData: ModuleData)(s: Statement) : Statement = {
+    val clkNetwork = moduleData.clkNetwork
     s match {
       // inst.clock <= clockPort
       case Connect(info, SubField(Reference(inst_name, _, _, _), lhs_name, ClockType, _), Reference(rhs_name, ClockType, _, _)) =>
-        inst2clk(Tuple2(inst_name, lhs_name)) = rhs_name
+        clkNetwork(s"${inst_name}/${lhs_name}") = rhs_name
 
       // reg name : Clock
       case d: DefRegister =>
-        inst2clk(Tuple2(d.name, "reg")) = d.clock match {
+        clkNetwork(d.name) = d.clock match {
           case SubField(Reference(rhs_inst_name, _, _, _), rhs_name, ClockType, _) =>
             s"${rhs_inst_name}/${rhs_name}"
           case _ =>
@@ -291,13 +492,13 @@ class FI extends Transform {
         }
 
       case m: DefMemory =>
-        (m.readers ++ m.writers ++ m.readwriters).map(port => s"$port/clock")
+        (m.readers ++ m.writers ++ m.readwriters).foreach(port => s"${m.name}/${port}/clock")
 
       case Connect(info, WRef(lhs_name, ClockType, _, _), WRef(rhs_name, ClockType, _, _)) =>
-        inst2clk(Tuple2(lhs_name, "wire")) = rhs_name
+        clkNetwork(lhs_name) = rhs_name
 
       case DefNode(info, lhs_name, SubField(Reference(rhs_inst_name, _, _, _), rhs_name, ClockType, _)) =>
-        inst2clk(Tuple2(lhs_name, "inst")) = s"${rhs_inst_name}/${rhs_name}"
+        clkNetwork(lhs_name) = s"${rhs_inst_name}/${rhs_name}"
 
       case DefNode(info, lhs_name, rhs) =>
         val signals = new ListBuffer[String]
@@ -308,12 +509,12 @@ class FI extends Transform {
           case 0 =>
           case 1 =>
             var rhs_name = all.head
-            inst2clk(Tuple2(lhs_name, "wire")) = rhs_name
+            clkNetwork(lhs_name) = rhs_name
           case _ =>
             clocks.size match {
               case 0 =>
               case 1 =>
-                inst2clk(Tuple2(lhs_name, "wire")) = clocks.head
+                clkNetwork(lhs_name) = clocks.head
               case _ =>
                 throw new Exception(s"Single clock node fan-in to every clock node assumption broken at ${lhs_name}${info}")
             }
@@ -322,7 +523,7 @@ class FI extends Transform {
       case _ =>
     }
 
-    s map populateInst2Clk(inst2clk)
+    s map populateClkNetwork(moduleData)
   }
 
   def findRef(signals: ListBuffer[String], clocks: ListBuffer[String])(e: Expression) : Expression = {
@@ -336,35 +537,100 @@ class FI extends Transform {
     e map findRef(signals, clocks)
   }
 
+  def populateModuleData(moduleDataMap: Map[String, ModuleData])(m: DefModule) : DefModule = {
+    if (!m.ports.forall(_.direction == Input))
+      m map populateInsts(m, moduleDataMap)
+
+//    println(s"MODULE: ${m.name}")
+    m map populateClkNetwork(moduleDataMap(m.name))
+    m map populateModulePorts(moduleDataMap(m.name))
+    m
+  }
+
+  def populateInsts(m: DefModule, moduleDataMap: Map[String, ModuleData])(s: Statement) : Statement = {
+    val moduleData = moduleDataMap(m.name)
+    s match {
+      case i: DefInstance =>
+        moduleData.insts(i.name) = moduleDataMap(i.module)
+        s
+
+      case i: DefRegister =>
+        val width = i.tpe.asInstanceOf[GroundType].width.asInstanceOf[IntWidth]
+        moduleData.ffs += IntWidth.unapply(width).get.toInt
+        s
+
+      case i: DefMemory =>
+        val width = IntWidth.unapply(i.dataType.asInstanceOf[GroundType].width.asInstanceOf[IntWidth]).get.toInt
+        val depth = i.depth
+        val id = i.name
+        val tpe = if (i.readLatency == 1 && i.writeLatency == 1) "SyncMem"
+          else if (i.readLatency == 0 && i.writeLatency == 1) "AsyncMem"
+          else "ERROR"
+
+        assert(tpe != "ERROR")
+        moduleData.macros(id) = MacroData(tpe, log2Up(depth.intValue) + log2Up(width), mutable.Map[String, Expression]())
+
+//        if (tpe == "AsyncMem") {
+//          println(s"Module ${m.name} AsyncMem ${i.name}: ${i.readers.size}R${i.writers.size}W")
+//        }
+
+        s
+
+      case _ =>
+        s map populateInsts(m, moduleDataMap)
+    }
+  }
+
+  def populateExtModuleData(moduleDataMap: Map[String, ModuleData], path: String) : Unit = {
+    val source = Source.fromFile(path)
+
+    println(moduleDataMap.keys)
+
+    for (line <- source.getLines) {
+      val splitLine = line.split(" ")
+      val paramItems = for (i <- 0 until splitLine.length by 2) yield {
+        splitLine(i) -> splitLine(i+1)
+      }
+      val params = paramItems.toMap
+      val injBitsWidth = log2Up(params("depth").toInt) + log2Up(params("width").toInt)
+      moduleDataMap(params("name")).setFFParams(0)
+      moduleDataMap(params("name")).setMacroParams(n=1, width=injBitsWidth)
+    }
+    source.close
+  }
+
   def execute(state: CircuitState): CircuitState = {
     // TODO: Need to check if inj port already exists
+    val extModuleFile = "regress/DigitalTop.mems.conf"
     var circuit = state.circuit
-    val mod2inj: Mod2Inj = scala.collection.mutable.Map() ++
-      circuit.modules.map(m => m.name -> (Option.empty[Int], scala.collection.mutable.Map[String, Option[Int]]())).toMap
 
-    val mod2clk = mutable.Map[String, mutable.Map[(String, String), String]]()
-    circuit map populateMod2Clk(mod2clk)
+//    for (m <- circuit.modules) {
+//      if (m.name == "Queue_7") {
+//        printModule(m)
+//      }
+//    }
+    println(s"Characterizing the circuit -- ${circuit.modules.size}")
+    val moduleDataMap = circuit.modules.map(m => m.name -> new ModuleData).toMap
+    circuit = circuit map populateModuleData(moduleDataMap)
+    populateExtModuleData(moduleDataMap, extModuleFile)
 
-    var i = 0
-    while (! mod2inj.forall(_._2._1.nonEmpty)) {
-      circuit = circuit map populateMod2Inj(mod2inj)
-      i += 1
-    }
-//    println(s"Final Mod2Inj: ${mod2inj}")
-//    println(s"Final Mod2Clk: ${mod2clk}")
+    println(s"Creating extra ports -- ${circuit.modules.size}")
+    circuit = circuit map addInjPortsMod(moduleDataMap)
+    circuit = circuit map addHaltPortsMod
 
     val fp = new PrintWriter(new File("fiff.log"))
-    circuit = circuit map addInjPortsMod(mod2inj)
-    circuit = circuit map addHaltPortsMod(mod2inj)
-
-//    circuit.foreachModule(m => println(m.ports))
-
-    println(s"Connecting INJ")
-    circuit = circuit map connectInjMod(mod2inj, mod2clk, fp)
-    println(s"Connecting HALT")
-    circuit = circuit map connectHaltMod(mod2clk)
-
+    println(s"Connecting inj -- ${circuit.modules.size}")
+    circuit = circuit map connectInjMod(moduleDataMap, fp)
+    println(s"Connecting halt -- ${circuit.modules.size}")
+    circuit = circuit map connectHaltMod(moduleDataMap)
     fp.close()
-    state.copy(circuit = circuit)
+//
+    val outState = state.copy(circuit = circuit)
+    println(s"Done! -- ${circuit.modules.size}")
+    println(s"stmtDelta: ${stmtDelta}")
+
+    println(moduleDataMap("cc_dir_0").allMacros)
+
+    outState
   }
 }
