@@ -15,7 +15,7 @@ lazy val isAtLeastScala213 = Def.setting {
 
 lazy val firrtlSettings = Seq(
   name := "firrtl",
-  version := "1.5-SNAPSHOT",
+  version := "1.6-SNAPSHOT",
   addCompilerPlugin(scalafixSemanticdb),
   scalacOptions := Seq(
     "-deprecation",
@@ -36,7 +36,7 @@ lazy val firrtlSettings = Seq(
     "org.json4s" %% "json4s-native" % "3.6.12",
     "org.apache.commons" % "commons-text" % "1.9",
     "io.github.alexarchambault" %% "data-class" % "0.2.5",
-    "com.lihaoyi" %% "os-lib" % "0.7.8"
+    "com.lihaoyi" %% "os-lib" % "0.8.0"
   ),
   // macros for the data-class library
   libraryDependencies ++= {
@@ -132,7 +132,8 @@ lazy val docSettings = Seq(
   Compile / doc / scalacOptions ++= Seq(
     // ANTLR-generated classes aren't really part of public API and cause
     // errors in ScalaDoc generation
-    "-skip-packages", "firrtl.antlr",
+    "-skip-packages",
+    "firrtl.antlr",
     "-Xfatal-warnings",
     "-feature",
     "-diagrams",
