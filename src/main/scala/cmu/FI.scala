@@ -114,9 +114,9 @@ class ModuleData() {
     if (matches.isEmpty) {
       val portName = name.split("/")
       if (portName.size == 2) {
-        return SubField(WRef(portName(0)), s"halt_${portName(1)}", ClockType)
+        return SubField(WRef(portName(0)), s"${portName(1)}_halt", ClockType)
       } else {
-        return WRef(s"halt_${name}")
+        return WRef(s"${name}_halt")
       }
 
     } else {
@@ -239,21 +239,15 @@ class FI extends Transform {
               Connect(info, SubField(SubField(Reference(s.name), auxRdPort), "clk"), memData.signals(s"${auxRdPort}/clk")))
           }
 
+          fp.write(s"AsyncMem ${s.name} ${width}x${depth} idx=${injEnIdx}\n")
           stmtDelta += newStmts.size
           s
         }
 
       case s: DefInstance =>
-        if (s.module == "cc_dir_0_ext") {
-          println(s"Debug: 1")
-        }
         if (!moduleData.insts.contains(s.name)) {
           s
         } else {
-          if (s.module == "cc_dir_0_ext") {
-            println(s"Debug: 2")
-          }
-
           val newStmts = mutable.ArrayBuffer[Statement]()
 
           val ffWidth = moduleData.insts(s.name).allffs
@@ -272,9 +266,6 @@ class FI extends Transform {
           if (macroInjWidth == 0) {
             s
           } else {
-            if (s.module == "cc_dir_0_ext") {
-              println(s"Debug: 3")
-            }
             val macroOffset = moduleData.getMacroOffset(macroInjWidth)
             val sel_lhs = SubField(WRef(s.name), "inj_macro_sel", UnknownType, UnknownFlow)
             val sel_rhs = DoPrim(PrimOps.Bits, Seq(WRef("inj_macro_sel")), Seq(macroOffset + macroInjWidth - 1, macroOffset), sel_lhs.tpe)
@@ -299,20 +290,20 @@ class FI extends Transform {
       // instance.clock <= clockPort
       case s: DefInstance =>
         val clks = moduleData.clkNetwork.filter(_._1.split("/")(0) == s.name)
-        val halt_connects = clks.map(clk => Connect(s.info, SubField(WRef(s.name), s"halt_${clk._1.split("/")(1)}", UnknownType, UnknownFlow), moduleData.getHaltPortOf(clk._2)))
+        val halt_connects = clks.map(clk => Connect(s.info, SubField(WRef(s.name), s"${clk._1.split("/")(1)}_halt", UnknownType, UnknownFlow), moduleData.getHaltPortOf(clk._2)))
         Block(Seq(s) ++ halt_connects)
 
       // clockPort <= net
       case Connect(info, Reference(lhs_name, ClockType, PortKind, lhs_flow), Reference(rhs_name, rhs_type, rhs_kind, rhs_flow)) =>
         val halt_conn = Connect(info,
-          WRef(s"halt_${lhs_name}"),
+          WRef(s"${lhs_name}_halt"),
           moduleData.getHaltPortOf(rhs_name))
         Block(Seq(s, halt_conn))
 
       // clockPort <= instance.clock
       case Connect(info, Reference(lhs_name, ClockType, PortKind, lhs_flow), SubField(rhs_ref, rhs_name, rhs_kind, rhs_flow)) =>
         val halt_conn = Connect(info,
-          WRef(s"halt_${lhs_name}"),
+          WRef(s"${lhs_name}_halt"),
           moduleData.getHaltPortOf(s"${rhs_ref.serialize}/$rhs_name"))
         Block(Seq(s, halt_conn))
 
@@ -354,7 +345,7 @@ class FI extends Transform {
 
   def addHaltPortsMod(m: DefModule) : DefModule = {
     val clkPorts = m.ports.filter(_.tpe == ClockType)
-    val haltPorts = clkPorts.map(p => Port(NoInfo, s"halt_${p.name}", p.direction, UIntType(new IntWidth(1))))
+    val haltPorts = clkPorts.map(p => Port(NoInfo, s"${p.name}_halt", p.direction, UIntType(new IntWidth(1))))
 
     val newPorts = haltPorts ++ m.ports
 
@@ -380,15 +371,7 @@ class FI extends Transform {
       m
     } else {
       fp.write(s"--- Module: ${m.name}\n")
-      m match {
-        case i: Module =>
-          println(s"Class: ${i.body.getClass}")
-        case _ =>
-      }
-
       m map connectInjStmt(moduleDataMap(m.name), fp)
-
-
     }
   }
 
@@ -408,10 +391,6 @@ class FI extends Transform {
      * Find the AsyncMem port connections and populate ModuleData to contain the nets that
      * connect to them. It also removes those statements to be replaced by the connectInj method.
      */
-//    if (containsReference(s, "io_deq_bits_data")) {
-//      println("This stmt contains the net:")
-//      println(s)
-//    }
 
     val asyncMems = moduleData.macros.filter(m => m._2.tpe == "AsyncMem").keys.toSeq
     s match {
@@ -601,7 +580,7 @@ class FI extends Transform {
 
   def execute(state: CircuitState): CircuitState = {
     // TODO: Need to check if inj port already exists
-    val extModuleFile = "regress/DigitalTop.mems.conf"
+    val extModuleFile = "regress/chipyard.TestHarness.CMURocketConfig.top.mems.conf"
     var circuit = state.circuit
 
 //    for (m <- circuit.modules) {
@@ -628,8 +607,6 @@ class FI extends Transform {
     val outState = state.copy(circuit = circuit)
     println(s"Done! -- ${circuit.modules.size}")
     println(s"stmtDelta: ${stmtDelta}")
-
-    println(moduleDataMap("cc_dir_0").allMacros)
 
     outState
   }
